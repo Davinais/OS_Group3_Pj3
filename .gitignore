@@ -1,0 +1,16 @@
+.vscode
+
+# object
+*.o
+
+# binary
+page
+cachelab/csim
+cachelab/test-trans
+cachelab/tracegen
+
+# others
+cachelab/.csim_results
+cachelab/.marker
+group3_ans.txt
+*.tar
