@@ -1,20 +1,28 @@
 #include "cachelab.h"
+#include "list.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include <getopt.h>
-#include <math.h>
 #include <stdbool.h>
 
-int cache_size;
-int set_size;
-int line_len;
-int block_size;
+#define BUFFER_SIZE 64
 
-typedef struct cache{
+uint8_t set_len = 0;
+uint8_t line_size = 0;
+uint8_t block_len = 0;
+uint32_t hit_count = 0, miss_count = 0, eviction_count = 0;
+
+typedef struct line{
     uint64_t tag;
-    struct cache* next;
-}cache_t;
+    struct list_head list;
+}line_t;
+
+typedef struct set{
+    size_t size;
+    struct list_head line_head;
+}set_t;
 
 typedef struct result{
     bool miss;
@@ -22,67 +30,89 @@ typedef struct result{
     bool eviction;
 }result_t;
 
-int size_of_cache(int set_size, int line_len, int block_size){
-    return pow(2, (set_size + line_len + block_size));
+static inline void list_pop(struct list_head *head) {
+	if(!list_empty(head)) {
+        line_t *popped = list_entry(head->next, line_t, list);
+        list_del(head->next);
+        free(popped);
+    }
 }
 
-cache_t* searchCache(cache_t* head, int tag){
-    if(head == NULL) return NULL;
-    if(head->tag == tag) return head;
-    return search(head->next, tag);
+void freeLineList(struct list_head *head) {
+    struct list_head *listptr, *tmp;
+    line_t *entry;
+    list_for_each_safe(listptr, tmp, head) {
+        entry = list_entry(listptr, line_t, list);
+        list_del(listptr);
+        free(entry);
+    }
 }
 
-bool addCache(cache_t* head, int tag){
-    cache_t* new_cache = (cache_t*)malloc(sizeof(cache_t));
+line_t* searchCache(set_t *set, uint64_t tag){
+    line_t *entry;
+    list_for_each_entry(entry, &(set->line_head), list) {
+        if(entry->tag == tag) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+bool addLine(set_t *set, uint64_t tag){
+    line_t* new_cache = (line_t*)calloc(1, sizeof(line_t));
     new_cache->tag = tag;
-    new_cache->next = NULL;
 
     //add to back of the list
-    cache_t* temp = head;
-    int size_of_current_set = 0;
-    while(temp->next != NULL){
-        size_of_current_set ++;
-        temp = temp->next;
-    }
+    list_add_tail(&(new_cache->list), &(set->line_head));
+    (set->size)++;
 
-    //add new node
-    temp = new_cache;
-    
     //check valid cache
-    if(size_of_cache(size_of_current_set, line_len, block_size) < size_of_cache(set_size, line_len, block_size)){
+    if(set->size <= line_size){
         return false; //no eviction
     }
     else {
-        //delete head
-        head = head->next;
+        // Delete first entry, since our list is in time order
+        // First Entry would be the longest not used line
+        list_pop(&(set->line_head));
+        (set->size)--;
         return true;
     }
-} 
-
-uint64_t addr2tag(int addr){
-    uint64_t tag = 0;
-    return tag;
 }
 
-result_t load(cache_t* head, int addr){
-    result_t ret = {false, false, false};
-    uint64_t tag = addr2tag(addr);
-    if(searchCache(head, tag) != NULL) ret.hit = true;
-    else {
-        ret.miss = true;
-        if(addCache(head, tag)) ret.eviction = true;
-    }
+static inline uint64_t getTag(uint64_t addr){
+    return addr >> block_len;
 }
 
-//same wtf? modify need to call load and store
-result_t store(cache_t* head, int addr){
+result_t access(set_t *set, uint64_t tag){
     result_t ret = {false, false, false};
-    uint64_t tag = addr2tag(addr);
-    if(searchCache(head, tag) != NULL) ret.hit = true;
+    line_t *ret_cache;
+    // Search if the line is in cache
+    if((ret_cache = searchCache(set, tag)) != NULL){
+        // Line Linklist is ordered in used time 
+        // Recently used line would be put to the end
+        list_move_tail(&(ret_cache->list), &(set->line_head));
+        ret.hit = true;
+        hit_count++;
+    }
     else {
         ret.miss = true;
-        if(addCache(head, tag)) ret.eviction = true;
+        miss_count++;
+        // addLine() return true if there's eviction happened
+        if(addLine(set, tag)){
+            ret.eviction = true;
+            eviction_count++;
+        }
     }
+    return ret;
+}
+
+result_t load(set_t *set, uint64_t tag){
+    return access(set, tag);
+}
+
+//modify need to call load and store
+result_t store(set_t *set, uint64_t tag){
+    return access(set, tag);
 }
 
 void printHelp(char* name) {
@@ -104,14 +134,15 @@ int main(int argc, char *argv[])
 {
     char ch;
     char *trace_file = NULL;
-    uint8_t set_len, line_len, block_size = 0;
-    while((ch = getopt(argc, argv, "hvs:E:b:t")) != -1) {
+    bool verbose = false;
+    while((ch = getopt(argc, argv, "hvs:E:b:t:")) != -1) {
         switch(ch) {
             case 'h': {
                 printHelp(argv[0]);
                 return 0;
             }
             case 'v': {
+                verbose = true;
                 break;
             }
             case 's': {
@@ -119,26 +150,113 @@ int main(int argc, char *argv[])
                 break;
             }
             case 'E': {
-                line_len = (uint8_t)atoi(optarg);
+                line_size = (uint8_t)atoi(optarg);
                 break;
             }
             case 'b': {
-                block_size = (uint8_t)atoi(optarg);
+                block_len = (uint8_t)atoi(optarg);
                 break;
             }
             case 't': {
-                trace_file = optarg;
+                trace_file = strdup(optarg);
                 break;
             }
             default:
                 break;
         }
     }
-    if(!(set_len) || !(line_len) || !(block_size) || !(trace_file)) {
+    // If anything of the following be 0, the simulator won't work
+    if(!(set_len) || !(line_size) || !(block_len) || !(trace_file)) {
         fprintf(stderr, "%s: Missing required command line argument\n", argv[0]);
         printHelp(argv[0]);
         return EXIT_FAILURE;
     }
-    printSummary(0, 0, 0);
+
+    FILE *fptr;
+    if(!(fptr = fopen(trace_file, "r"))) {
+        perror("Error: ");
+        return EXIT_FAILURE;
+    }
+
+    uint8_t set_size = 1 << set_len;
+    set_t *cache = calloc(set_size, sizeof(set_t));
+    // Initialize set array
+    for(uint8_t i = 0; i < set_size; i++) {
+        cache[i].size = 0;
+        INIT_LIST_HEAD(&(cache[i].line_head));
+    }
+
+    char buf[BUFFER_SIZE] = { 0 };
+    char cmd;
+    uint64_t addr, offset, set, tag;
+    uint64_t set_mask = ((~0UL) >> ((sizeof(uint64_t) << 3) - set_len)) << (block_len);
+    result_t ret;
+    while((fgets(buf, sizeof(buf), fptr) != NULL)) {
+        // Avoid 'only new line ending' on the last line
+        // Also avoid instruction load command
+        if(buf[0] != '\r' && buf[0] != '\n' && buf[0] == ' ') {
+            sscanf(buf, " %c %lxu,%lxu", &cmd, &addr, &offset);
+            if(verbose) {
+                // Remove new line char at the end of line
+                if(buf[strlen(buf)-1] == '\n') {
+                    buf[strlen(buf)-1] = 0;
+                    if(buf[strlen(buf)-1] == '\r') {
+                        buf[strlen(buf)-1] = 0;
+                    }
+                }
+                printf("%s", buf+1);
+            }
+            set = (addr & set_mask) >> (block_len);
+            tag = getTag(addr);
+            switch (cmd) {
+                case 'L': {
+                    ret = load(cache+set, tag);
+                    break;
+                }
+                case 'S': {
+                    ret = store(cache+set, tag);
+                    break;
+                }
+                case 'M': {
+                    ret = load(cache+set, tag);
+                    if(verbose) {
+                        if(ret.miss) {
+                            printf(" miss");
+                        }
+                        else if(ret.hit) {
+                            printf(" hit");
+                        }
+                        if(ret.eviction) {
+                            printf(" eviction");
+                        }
+                    }
+                    ret = store(cache+set, tag);
+                    break;
+                }
+                default:
+                    break;
+            }
+            if(verbose) {
+                if(ret.miss) {
+                    printf(" miss");
+                }
+                else if(ret.hit) {
+                    printf(" hit");
+                }
+                if(ret.eviction) {
+                    printf(" eviction");
+                }
+                puts("");
+            }
+        }
+    }
+    fclose(fptr);
+
+    printSummary(hit_count, miss_count, eviction_count);
+    for(uint8_t i = 0; i < set_size; i++) {
+        freeLineList(&(cache[i].line_head));
+    }
+    free(cache);
+    free(trace_file);
     return 0;
 }
